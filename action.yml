@@ -30,6 +30,23 @@ inputs:
     description: "GitHub token for posting PR comments. Defaults to the built-in GITHUB_TOKEN."
     required: false
     default: ${{ github.token }}
+  policy-file:
+    description: >
+      Path to a policy file (JSON or YAML) holding the proposed policy set. When set,
+      the action replays your workspace's recorded traffic against these policies and
+      reports every call whose verdict would change. Leave empty to skip.
+    required: false
+    default: ""
+  fail-on-regression:
+    description: >
+      Fail the workflow when the proposed policies would newly block traffic that
+      currently succeeds. Loosening changes are always reported but never fail.
+    required: false
+    default: "true"
+  replay-limit:
+    description: "How many recent recorded calls to replay (max 2000)."
+    required: false
+    default: "500"
 
 outputs:
   total:
@@ -40,6 +57,14 @@ outputs:
     description: "Number of steps that did not match the expected decision."
   result:
     description: "Overall result: 'pass' or 'fail'."
+  replayed:
+    description: "Number of recorded calls replayed against the proposed policies."
+  verdict-changes:
+    description: "Number of replayed calls whose verdict would change."
+  newly-blocked:
+    description: "Replayed calls that currently succeed but would be blocked."
+  newly-allowed:
+    description: "Replayed calls that are currently blocked but would be allowed."
 
 runs:
   using: "node20"

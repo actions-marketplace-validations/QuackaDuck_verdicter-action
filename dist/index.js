@@ -44564,6 +44564,53 @@ async function evaluate(apiUrl, apiKey, agentId, tool, payload) {
     }
     return res.json();
 }
+// ─── Verdict regression ───────────────────────────────────────────────────────
+/**
+ * Load the proposed policy set from the repository.
+ *
+ * Accepts either a bare array of policies or an object with a `policies` key, so a
+ * file exported from the dashboard works without editing.
+ */
+function loadPolicyFile(policyPath) {
+    const abs = path.isAbsolute(policyPath)
+        ? policyPath
+        : path.join(process.env.GITHUB_WORKSPACE ?? process.cwd(), policyPath);
+    if (!fs.existsSync(abs)) {
+        throw new Error(`Policy file not found: ${abs}`);
+    }
+    const raw = fs.readFileSync(abs, "utf8");
+    const parsed = (abs.endsWith(".yml") || abs.endsWith(".yaml"))
+        ? yaml.load(raw)
+        : JSON.parse(raw);
+    const policies = Array.isArray(parsed) ? parsed : parsed?.policies;
+    if (!Array.isArray(policies)) {
+        throw new Error("Policy file must be an array of policies, or an object with a 'policies' array.");
+    }
+    for (const [i, p] of policies.entries()) {
+        if (!p?.name)
+            throw new Error(`policies[${i}] is missing a 'name'.`);
+        if (!p?.rule_json?.rules)
+            throw new Error(`policies[${i}] ('${p.name}') is missing 'rule_json.rules'.`);
+    }
+    return { policies };
+}
+async function runPolicyDiff(apiUrl, apiKey, policyFile, replayLimit) {
+    const url = `${apiUrl.replace(/\/$/, "")}/api/v1/policy-diff`;
+    const res = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`,
+            "User-Agent": "verdicter-action/1",
+        },
+        body: JSON.stringify({ policies: policyFile.policies, limit: replayLimit }),
+    });
+    if (!res.ok) {
+        const body = await res.text();
+        throw new Error(`Policy diff returned ${res.status}: ${body}`);
+    }
+    return res.json();
+}
 // ─── PR comment ───────────────────────────────────────────────────────────────
 function decisionIcon(passed, expected) {
     if (expected === null)
@@ -44580,7 +44627,7 @@ function decisionBadge(decision) {
     };
     return map[upper] ?? upper;
 }
-function buildComment(results, totalPassed, totalFailed, totalSteps) {
+function buildComment(results, totalPassed, totalFailed, totalSteps, diff = null) {
     const allPassed = totalFailed === 0;
     const header = allPassed
         ? `## ✅ Verdicter CI - All scenarios passed (${totalPassed}/${totalSteps})`
@@ -44597,19 +44644,22 @@ ${rows}`;
     const footer = allPassed
         ? `\n---\n*All policy checks passed. No regressions detected.*`
         : `\n---\n*${totalFailed} step${totalFailed !== 1 ? "s" : ""} produced unexpected decisions. Review your policy changes or update the expected outcomes in \`.verdicter/ci.yml\`.*`;
-    return [header, ...sections, footer].join("\n\n");
+    // The replay section carries far more signal than the scenario table — it is about
+    // real traffic rather than hand-written fixtures — so it goes above the footer.
+    const diffSection = diff ? [diff.markdown] : [];
+    return [header, ...sections, ...diffSection, footer].join("\n\n");
 }
 // Direct GitHub REST API calls via fetch — no @actions/github SDK needed
 async function postPRComment(token, comment) {
     const eventPath = process.env.GITHUB_EVENT_PATH;
     if (!eventPath || !fs.existsSync(eventPath)) {
-        core.info("No GITHUB_EVENT_PATH — skipping PR comment.");
+        core.info("No GITHUB_EVENT_PATH - skipping PR comment.");
         return;
     }
     const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
     const pr = event.pull_request;
     if (!pr) {
-        core.info("Not a pull request — skipping PR comment.");
+        core.info("Not a pull request - skipping PR comment.");
         return;
     }
     const [owner, repo] = (process.env.GITHUB_REPOSITORY ?? "").split("/");
@@ -44672,6 +44722,9 @@ async function run() {
     const configPath = core.getInput("config");
     const failOnUnexpected = core.getInput("fail-on-unexpected") !== "false";
     const shouldComment = core.getInput("post-comment") !== "false";
+    const policyFilePath = core.getInput("policy-file");
+    const failOnRegression = core.getInput("fail-on-regression") !== "false";
+    const replayLimit = Number(core.getInput("replay-limit") || "500") || 500;
     // Load config
     let config;
     try {
@@ -44739,18 +44792,49 @@ async function run() {
         scenarioResults.push({ name: scenario.name, steps: stepResults, passed: scenarioPassed });
         core.endGroup();
     }
+    // ── Verdict regression against recorded traffic ────────────────────────────
+    // Optional: only runs when the repo declares a policy file. This is the check
+    // that catches "this edit reads fine but would break 12 live calls".
+    let diff = null;
+    if (policyFilePath) {
+        core.startGroup("Verdict regression");
+        try {
+            const policyFile = loadPolicyFile(policyFilePath);
+            core.info(`Replaying up to ${replayLimit} recorded calls against ${policyFile.policies.length} proposed policies`);
+            diff = await runPolicyDiff(apiUrl, apiKey, policyFile, replayLimit);
+            core.info(`Replayed ${diff.replayed} calls: ${diff.flips.length} verdict change(s)`);
+            if (diff.summary.tightened > 0) {
+                core.warning(`${diff.summary.tightened} call(s) that currently succeed would start being blocked.`);
+                for (const f of diff.flips.filter((x) => x.direction === "tightened").slice(0, 10)) {
+                    core.warning(`  ${f.action_type} (${f.agent_name}): ${f.before.toUpperCase()} → ${f.after.toUpperCase()} - ${f.after_reason}`);
+                }
+            }
+            if (diff.summary.loosened > 0) {
+                core.warning(`${diff.summary.loosened} call(s) that are currently blocked would start being allowed.`);
+            }
+        }
+        catch (err) {
+            // A failed replay must not mask the scenario results, which are the primary check.
+            core.warning(`Verdict regression skipped: ${err}`);
+        }
+        core.endGroup();
+    }
     // Set outputs
     core.setOutput("total", String(totalSteps));
     core.setOutput("passed", String(totalPassed));
     core.setOutput("failed", String(totalFailed));
     core.setOutput("result", totalFailed === 0 ? "pass" : "fail");
+    core.setOutput("replayed", String(diff?.replayed ?? 0));
+    core.setOutput("verdict-changes", String(diff?.flips.length ?? 0));
+    core.setOutput("newly-blocked", String(diff?.summary.tightened ?? 0));
+    core.setOutput("newly-allowed", String(diff?.summary.loosened ?? 0));
     // Job summary
     await writeJobSummary(scenarioResults, totalPassed, totalFailed, totalSteps);
     // PR comment
     const githubToken = core.getInput("github-token") || process.env.GITHUB_TOKEN;
     if (shouldComment && githubToken) {
         try {
-            const comment = buildComment(scenarioResults, totalPassed, totalFailed, totalSteps);
+            const comment = buildComment(scenarioResults, totalPassed, totalFailed, totalSteps, diff);
             await postPRComment(githubToken, comment);
         }
         catch (err) {
@@ -44764,8 +44848,17 @@ async function run() {
     if (totalFailed > 0 && failOnUnexpected) {
         core.setFailed(`${totalFailed} scenario step${totalFailed !== 1 ? "s" : ""} produced unexpected decisions.`);
     }
+    else if (diff?.has_breaking_changes && failOnRegression) {
+        // Only tightening fails the build. A loosening is reported loudly but does not
+        // block: deliberately relaxing a policy is a normal, intentional change, whereas
+        // silently breaking working traffic almost never is.
+        core.setFailed(`${diff.summary.tightened} call${diff.summary.tightened !== 1 ? "s" : ""} that currently succeed would be blocked by these policy changes. ` +
+            `Set fail-on-regression: false if this is intended.`);
+    }
     else {
         core.info(`\nVerdicter CI complete: ${totalPassed}/${totalSteps} steps passed.`);
+        if (diff)
+            core.info(`Replayed ${diff.replayed} recorded calls, ${diff.flips.length} verdict change(s).`);
     }
 }
 run().catch((err) => core.setFailed(String(err)));
